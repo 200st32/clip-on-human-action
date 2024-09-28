@@ -16,6 +16,35 @@ import matplotlib.pyplot as plt
 import matplotlib
 from pynvml import *
 import opendatasets as od
+from PIL import Image
+from transformers import AutoImageProcessor
+from A_CLIP.datasets import GetThreeRandomResizedCrop
+
+class ACLIPDataset(ImageFolder):
+
+    def __getitem__(self, index):
+
+        get_three_crop = GetThreeRandomResizedCrop(224, scale=(0.5, 1.0))
+        ema_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+        ])
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        res = get_three_crop(sample)
+
+        im1, ret1 = res[0]
+        im2, ret2 = res[1]
+        im3, ret3 = res[2]
+
+        im1 = self.transform(im1)
+        im2 = self.transform(im2)
+        im3 = ema_transform(im3)
+
+        pos = np.array([ret1,ret2,ret3])
+
+        return [im1, im2, im3], pos, target 
 
 class MultiLabelDataset(ImageFolder):
     def __getitem__(self, index):
@@ -38,7 +67,7 @@ class MultiLabelDataset(ImageFolder):
         return sample, multi_target 
 
 
-def getdata(batch_size, multi_label=False, data_path="/home/cap6411.student1/CVsystem/assignment/hw5/human-action-recognition-dataset/Structured/"):
+def getdata(batch_size, m_type, data_path="/home/cap6411.student1/CVsystem/assignment/hw5/human-action-recognition-dataset/Structured/"):
 
     isExist = os.path.exists(data_path)
     if isExist==False:
@@ -72,10 +101,48 @@ def getdata(batch_size, multi_label=False, data_path="/home/cap6411.student1/CVs
     ])
 
     # Split out val dataset from train dataset
-    if multi_label:
-        train_dataset = MultiLabelDataset(data_dir+"train/", transform=data_transforms_train)
-        test_dataset = MultiLabelDataset(data_dir+"test/", transform=data_transforms)
+    if m_type == 'siglip':
+        print("multi-label data")
+        processor = AutoImageProcessor.from_pretrained("google/siglip-base-patch16-224")
+        size = processor.size["height"]
+        mean = processor.image_mean
+        std = processor.image_std
+
+        multi_transform = transforms.Compose([
+            transforms.Resize((size, size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]) 
+        train_dataset = MultiLabelDataset(data_dir+"train/", transform=multi_transform)
+        test_dataset = MultiLabelDataset(data_dir+"test/", transform=multi_transform)
+    elif m_type == 'test_aclip':
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
+        val_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize
+        ])
+
+        train_transform = transforms.Compose([
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)  # not strengthened
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            #transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.1),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.))], p=0.1),
+            #transforms.RandomApply([Solarize()], p=0.2),
+            transforms.RandomSolarize(threshold=192.0, p=0.2),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        train_dataset = ACLIPDataset(data_dir+"train/", transform=data_transforms_train)
+        test_dataset = ACLIPDataset(data_dir+"test/", transform=val_transform) 
     else:
+        print("normal data")
         train_dataset = datasets.ImageFolder(data_dir+"train/", transform=data_transforms_train)
         test_dataset = datasets.ImageFolder(data_dir+"test/", transform=data_transforms)
     n = len(train_dataset)
@@ -141,6 +208,50 @@ def train_model(model, train_loader, optimizer, loss_function, device, m_type):
     h = nvmlDeviceGetHandleByIndex(0)
     info = nvmlDeviceGetMemoryInfo(h)
     print(f'Train Epoch GPU memory used: {info.used/1000000:.4f} MB') 
+    return epoch_loss, epoch_acc
+
+def train_aclip_model(model, train_loader, optimizer, loss_function, device, m_type):
+    start_time = time.time()
+    model.train()
+
+    nvmlInit()
+    running_loss = 0.0
+    running_corrects = 0
+
+    for inputs, pos, labels in tqdm(train_loader):
+
+        inputs = [torch.cat([inputs[0], inputs[1]], dim=0), inputs[2]]
+        inputs = [tensor.cuda(device, non_blocking=True) for tensor in inputs]
+        positions = pos
+
+        #inputs = inputs.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        with torch.set_grad_enabled(True):
+            outputs = model(inputs[0], inputs[1], positions)
+            _, preds = torch.max(outputs, 1)
+            loss = loss_function(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        if m_type == "siglip":
+            running_corrects += torch.sum((preds == labels.data).all(dim=1))
+        else:
+            running_corrects += torch.sum(preds == labels.data)
+
+    epoch_loss = running_loss / len(train_loader.dataset)
+    epoch_acc = running_corrects.double() / len(train_loader.dataset)
+
+    end_time = time.time()
+    time_elapsed = end_time - start_time
+    print('Train Loss: {:.4f} Acc: {:.4f} Time: {:.0f}m {:.0f}s'.format(epoch_loss, epoch_acc, time_elapsed // 60, time_elapsed % 60)) # Modify this line
+    h = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(h)
+    print(f'Train Epoch GPU memory used: {info.used/1000000:.4f} MB')
     return epoch_loss, epoch_acc
 
 def val_model(model, val_loader, loss_function, device, m_type):
@@ -227,5 +338,5 @@ def test_model(model, test_loader, loss_function, device, m_type):
 
 if __name__ == '__main__':
 
-    getdata(16, multi_label=True)
+    getdata(16, m_type='test_aclip')
 

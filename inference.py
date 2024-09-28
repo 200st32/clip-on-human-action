@@ -12,17 +12,28 @@ from torchvision.transforms import Resize, ConvertImageDtype, Normalize
 from functools import partial
 import myutils
 import Mymodel
+from transformers import AutoImageProcessor
 
-
-def preprocess_image(image_path: str, device: torch.device) -> torch.Tensor:
+def preprocess_image(image_path: str, device: torch.device, m_type) -> torch.Tensor:
     image = Image.open(image_path)
     
-    data_transforms = transforms.Compose([
-        transforms.Resize(size=(224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225])
-    ])
+    if m_type == 'siglip':
+        processor = AutoImageProcessor.from_pretrained("google/siglip-base-patch16-224")
+        size = processor.size["height"]  
+        std = processor.image_std
+        mean = processor.image_mean
+        data_transforms = transforms.Compose([
+            transforms.Resize((size, size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+    else:
+        data_transforms = transforms.Compose([
+            transforms.Resize(size=(224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+        ])
 
     tensor = data_transforms(image)
     tensor = tensor.unsqueeze(0)
@@ -66,19 +77,28 @@ def main():
     # Start the verification mode of the model.
     model.eval()
 
-    input_img = preprocess_image(args.image_path, device)
+    input_img = preprocess_image(args.image_path, device, args.type)
 
     # Inference
     with torch.no_grad():
-        output = model(input_img)
-
+        if args.type=='siglip':
+            outputs = model(input_img)
+            logits = outputs.logits
+            sigmoid = torch.nn.Sigmoid()
+            output = sigmoid(logits.squeeze())
+        else: 
+            output = model(input_img)
+    print(output)
     # Calculate the highest classification probability
     prediction_class_index = torch.topk(output, k=3).indices.squeeze(0).tolist()
-
+    print(prediction_class_index) 
     # Print classification results
     for class_index in prediction_class_index:
         prediction_class_label = class_label_map[class_index]
-        prediction_class_prob = torch.softmax(output, dim=1)[0, class_index].item()
+        if args.type == 'siglip':
+            prediction_class_prob = torch.softmax(output, dim=0)[class_index].item()
+        else:
+            prediction_class_prob = torch.softmax(output, dim=1)[0, class_index].item()
         print(f"{prediction_class_label}: {prediction_class_prob * 100:.2f}%")
 
 
